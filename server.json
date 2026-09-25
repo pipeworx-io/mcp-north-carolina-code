@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/north-carolina-code",
   "title": "North Carolina Code",
   "description": "North Carolina General Statutes — state statutes by citation.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "websiteUrl": "https://pipeworx.io/packs/north-carolina-code",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-north-carolina-code",
