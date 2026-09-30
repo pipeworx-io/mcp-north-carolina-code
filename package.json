@@ -1,7 +1,7 @@
 {
   "name": "@pipeworx/mcp-north-carolina-code",
-  "version": "0.1.2",
-  "description": "North Carolina General Statutes — state statutes by citation.",
+  "version": "0.1.3",
+  "description": "North Carolina General Statutes — state statutes by citation, plus topic",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-cdad21c15dee80a95efa32eb4b801d390ae8edf38b5ff662bb664e57b47ed313",
-    "sourceCommit": "97740c6ee04c8acbfe7dddcacfde9e88ff2b9ca0"
+    "sourceHash": "v1-0a8ddda04a32330210c8bc54a9bc4d0ce08e16473a52f2940cc2481d22334eed",
+    "sourceCommit": "658bedc4e66c6eab7e17c569f81012a2ee312624"
   }
 }

@@ -807,45 +807,175 @@ function sliceSection(text: string, heading: RegExp, next: RegExp): string | nul
   return best && best.length > 0 ? best : null;
 }
 /**
- * North Carolina General Statutes — state statutes by citation.
+ * North Carolina General Statutes — state statutes by citation, plus topic
+ * search.
  *
- * A relief after the others: NC returns a real 404 for a section that does not
- * exist. Four of the ten state sources built so far answer 200 for everything
- * and force the miss to be detected in markup; this one just says no.
+ * PRE-FETCHED TEXT FIRST (fleet #2505). The per-section live path
+ * (BySection/Chapter_N/GS_N-M.html) is throttled: 82 of 85 calls timed out on
+ * 2026-09-29, up from 99% failing over 60 days. scripts/ingest-nc-statutes.mjs
+ * fetches ncleg.gov's own per-CHAPTER bulk documents instead
+ * (EnactedLegislation/Statutes/HTML/ByChapter/Chapter_N.html — one request per
+ * chapter/subchapter, 396 measured, not one per of ~34k sections) and splits
+ * each on its "&sect; N-M. &nbsp;Heading" markers, writing one JSON bundle per
+ * chapter to the DATASETS R2 bucket at `statutes/nc/<chapter>.json`. Measured
+ * with zero throttling across the whole crawl — the per-section path is what
+ * gets rate-limited, not this one.
+ *
+ * A citation lookup tries the local bundle first and falls back to the
+ * original per-section live fetch only if the bundle is missing or the
+ * section is not in it.
+ *
+ * SEARCH is new: FTS5 in a SQLite Durable Object (workers/gateway/src/
+ * search-shard.ts), reusing the SEARCH_SHARD binding under shard name
+ * "nc-statutes" — no new Cloudflare binding (the gateway sits at its
+ * text-binding ceiling, docs/gateway-text-binding-limit.md). Hit ids resolve
+ * back to citations via `statutes/nc/_index.json`, built by the same loader.
+ *
+ * The chapter is still the part of the citation before the dash, so "14-17"
+ * gives both the bundle key and, in the live fallback, the directory and file
+ * with no lookup table:
  *
  *   /Statutes/HTML/BySection/Chapter_14/GS_14-17.html   -> murder
  *   /Statutes/HTML/BySection/Chapter_14/GS_14-9999.html -> 404
- *
- * The chapter is the part of the citation before the dash, so "14-17" gives
- * both the directory and the file with no lookup table.
  */
 
-// Bound every fetch() in this pack to a fixed timeout — an upstream that
-// degrades without erroring would otherwise hold the Worker in `await fetch()`
-// until its own execution budget kills the request (minutes, not seconds).
-// Mirrors the epoFetch / usaspending retryFetch pattern (fleet #685).
 async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response> {
   return fetchWithTimeout(url, init ?? {}, 'North Carolina General Statutes');
 }
 
 const BASE = 'https://www.ncleg.gov/EnactedLegislation/Statutes/HTML/BySection';
 const UA = 'pipeworx-mcp-north-carolina-code/1.0 (+https://pipeworx.io)';
+const R2_PREFIX = 'statutes/nc';
 
-const tools: McpToolExport['tools'] = [{
-  name: 'nc_general_statute',
-  description:
-    'Get the FULL TEXT of a section of the North Carolina General Statutes — North Carolina state law — by citation. "N.C.G.S. 14-17" is first degree murder. Returns the statutory text. Keyless. Use for "what does North Carolina General Statute 14-17 say" or to check an NC statute a case relies on.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      section: { type: 'string', description: 'Section as cited, e.g. "14-17" or "20-138.1". The chapter is the part before the first dash.' },
+interface R2Like {
+  get(key: string): Promise<{ text(): Promise<string> } | null>;
+}
+
+interface LocalSection {
+  section: string;
+  heading: string | null;
+  text: string;
+  url: string;
+}
+
+interface LocalBundle {
+  chapter: string;
+  sections: LocalSection[];
+  ingested_at: string;
+  source: string;
+}
+
+interface IndexEntry {
+  id: number;
+  chapter: string;
+  section: string;
+  heading: string | null;
+  text_chars: number;
+}
+
+interface StatuteIndex {
+  jurisdiction: string;
+  ingested_at: string;
+  entries: IndexEntry[];
+}
+
+function r2FromArgs(args: Record<string, unknown>): R2Like | undefined {
+  return args._r2 as R2Like | undefined;
+}
+
+async function readJson<T>(r2: R2Like, key: string): Promise<T | null> {
+  try {
+    const obj = await r2.get(key);
+    if (!obj) return null;
+    return JSON.parse(await obj.text()) as T;
+  } catch {
+    return null;
+  }
+}
+
+const tools: McpToolExport['tools'] = [
+  {
+    name: 'nc_general_statute',
+    description:
+      'Get the FULL TEXT of a section of the North Carolina General Statutes — North Carolina state law — by citation. "N.C.G.S. 14-17" is first degree murder. Returns the statutory text with a data_as_of timestamp. Keyless. Use for "what does North Carolina General Statute 14-17 say" or to check an NC statute a case relies on.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        section: { type: 'string', description: 'Section as cited, e.g. "14-17" or "20-138.1". The chapter is the part before the first dash.' },
+      },
+      required: ['section'],
     },
-    required: ['section'],
   },
-}];
+  {
+    name: 'nc_statute_search',
+    description:
+      'Search North Carolina General Statutes BY TOPIC or keyword rather than citation — "election conduct at polling places", "landlord retaliatory eviction", "concealed handgun permit". Returns ranked sections with their citations; use nc_general_statute afterward for the full text of one. Full-text search, so it answers questions no citation lookup can. Keyless.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Topic or keywords, e.g. "election conduct at polling places".' },
+        limit: { type: 'number', description: 'Max results, default 10, max 25.' },
+      },
+      required: ['query'],
+    },
+  },
+];
 
-async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
-  if (name !== 'nc_general_statute') throw new Error(`Unknown tool: ${name}`);
+/**
+ * Three outcomes: the chapter bundle may not exist yet (try live), or it may
+ * exist and simply not carry this section — which, if the crawl reached the
+ * chapter at all, is authoritative (repealed/renumbered sections are normal)
+ * and does not need a live round trip to confirm. Unlike Illinois, NC's live
+ * path is only throttled rather than universally broken, so a live retry
+ * here is not doomed the way it is there — but skipping it when our own
+ * copy already answers is still the polite-crawling choice.
+ */
+async function localLookup(
+  r2: R2Like, chapter: string, section: string,
+): Promise<{ record: Record<string, unknown> } | { chapterKnown: true } | { chapterKnown: false }> {
+  const bundle = await readJson<LocalBundle>(r2, `${R2_PREFIX}/${chapter}.json`);
+  if (!bundle) return { chapterKnown: false };
+  const hit = bundle.sections.find((s) => s.section === section);
+  if (!hit) return { chapterKnown: true };
+  return {
+    record: {
+      citation: `N.C.G.S. § ${section}`, section, chapter,
+      heading: hit.heading,
+      text: hit.text, text_chars: hit.text.length,
+      url: hit.url,
+      source: 'pre-fetched text (ncleg.gov ByChapter bulk documents), keyless',
+      attribution: 'North Carolina statutes are public record.',
+      data_as_of: bundle.ingested_at,
+    },
+  };
+}
+
+async function liveLookup(raw: string, chapter: string) {
+  const url = `${BASE}/Chapter_${chapter}/GS_${raw}.html`;
+  const res = await pwFetch(url, { headers: { 'User-Agent': UA } });
+  if (res.status === 404) {
+    return { found: false, reason: 'section_not_found', section: raw, chapter,
+      message: `No section ${raw} in the North Carolina General Statutes (HTTP 404).`,
+      hint: 'Section numbers are not contiguous — repealed sections are normal.',
+      data_as_of: new Date().toISOString() };
+  }
+  if (!res.ok) throw new Error(`NC General Assembly returned HTTP ${res.status} for ${raw}`);
+  const text = statuteText(await res.text());
+  if (text.length < 40) {
+    return { found: false, reason: 'empty_document', section: raw,
+      message: `Section ${raw} resolved but returned no usable text — it may be repealed or reserved.`,
+      data_as_of: new Date().toISOString() };
+  }
+  return {
+    citation: `N.C.G.S. § ${raw}`, section: raw, chapter,
+    text, text_chars: text.length, url,
+    source: 'North Carolina General Assembly (ncleg.gov), live fetch, keyless',
+    attribution: 'North Carolina statutes are public record.',
+    data_as_of: new Date().toISOString(),
+  };
+}
+
+async function ncGeneralStatute(args: Record<string, unknown>) {
   const raw = String(args.section ?? '').trim().replace(/\s+/g, '').replace(/^(N\.?C\.?G\.?S\.?|GS)/i, '');
   const m = /^(\d+[A-Za-z]?)-(.+)$/.exec(raw);
   if (!m) {
@@ -853,24 +983,93 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       message: `"${args.section}" is not a North Carolina citation.`,
       hint: 'NC sections are chapter-section, e.g. "14-17" (murder) or "20-138.1" (DWI).' };
   }
-  const url = `${BASE}/Chapter_${m[1]}/GS_${raw}.html`;
-  const res = await pwFetch(url, { headers: { 'User-Agent': UA } });
-  if (res.status === 404) {
-    return { found: false, reason: 'section_not_found', section: raw, chapter: m[1],
-      message: `No section ${raw} in the North Carolina General Statutes (HTTP 404).`,
-      hint: 'Section numbers are not contiguous — repealed sections are normal.' };
+  const chapter = m[1];
+
+  const r2 = r2FromArgs(args);
+  if (r2) {
+    const local = await localLookup(r2, chapter, raw);
+    if ('record' in local) return local.record;
+    if (local.chapterKnown) {
+      return {
+        found: false, reason: 'section_not_found', section: raw, chapter,
+        message: `No section ${raw} in the North Carolina General Statutes (checked against a pre-fetched text of Chapter ${chapter}).`,
+        hint: 'Section numbers are not contiguous — repealed sections are normal.',
+        data_as_of: new Date().toISOString(),
+      };
+    }
   }
-  if (!res.ok) throw new Error(`NC General Assembly returned HTTP ${res.status} for ${raw}`);
-  const text = statuteText(await res.text());
-  if (text.length < 40) {
-    return { found: false, reason: 'empty_document', section: raw,
-      message: `Section ${raw} resolved but returned no usable text — it may be repealed or reserved.` };
+  return liveLookup(raw, chapter);
+}
+
+async function ncStatuteSearch(args: Record<string, unknown>) {
+  const q = String(args.query ?? '').trim();
+  if (!q) {
+    return { found: false, reason: 'empty_query',
+      message: 'nc_statute_search needs a query — search by topic, e.g. "election conduct at polling places".',
+      hint: 'To look up a known citation use nc_general_statute instead.' };
   }
+  const limit = Math.min(25, Math.max(1, Number(args.limit) || 10));
+  const ns = args._searchShards as DurableObjectNamespace | undefined;
+  const r2 = r2FromArgs(args);
+  if (!ns || !r2) {
+    return { found: false, reason: 'search_unavailable',
+      message: 'Topic search runs through Pipeworx\'s full-text index and is not available in a standalone install of this pack.',
+      hint: 'nc_general_statute (citation lookup) still works standalone.' };
+  }
+
+  // Over-fetch past `limit` — see the matching comment in
+  // mcps/illinois-code/src/index.ts's ilStatuteSearch.
+  const fetchLimit = Math.min(100, Math.max(limit * 3, 30));
+  const stub = ns.get(ns.idFromName('nc-statutes'));
+  const res = await stub.fetch('https://shard/query', {
+    method: 'POST',
+    body: JSON.stringify({ q, limit: fetchLimit }),
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!res.ok) {
+    return { found: false, reason: 'index_unreachable',
+      message: 'The North Carolina statute search index did not answer. This is an infrastructure failure, not an absence of matching sections.' };
+  }
+  const out = (await res.json()) as { results?: { opinion_id: number; score: number }[] };
+  const hits = out.results ?? [];
+  if (!hits.length) {
+    return { found: false, query: q,
+      message: `No section matched "${q}" in the North Carolina statute index.`,
+      hint: 'Try fewer or more general words — this is a full-text match, not semantic search.' };
+  }
+
+  const index = await readJson<StatuteIndex>(r2, `${R2_PREFIX}/_index.json`);
+  const byId = new Map((index?.entries ?? []).map((e) => [e.id, e]));
+  const results = hits
+    .map((h) => {
+      const e = byId.get(h.opinion_id);
+      if (!e) return null;
+      return {
+        citation: `N.C.G.S. § ${e.section}`,
+        chapter: e.chapter,
+        section: e.section,
+        heading: e.heading,
+        score: h.score,
+      };
+    })
+    .filter((r): r is NonNullable<typeof r> => r !== null)
+    .slice(0, limit);
+
   return {
-    citation: `N.C.G.S. § ${raw}`, section: raw, chapter: m[1],
-    text, text_chars: text.length, url,
-    source: 'North Carolina General Assembly (ncleg.gov), keyless',
-    attribution: 'North Carolina statutes are public record.',
+    found: results.length > 0,
+    query: q,
+    count: results.length,
+    results,
+    data_as_of: index?.ingested_at ?? null,
+    source: 'North Carolina General Statutes full-text search (North Carolina General Assembly)',
+    hint: 'Call nc_general_statute with the section from a result to get its full text.',
   };
 }
+
+async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  if (name === 'nc_general_statute') return ncGeneralStatute(args);
+  if (name === 'nc_statute_search') return ncStatuteSearch(args);
+  throw new Error(`Unknown tool: ${name}`);
+}
+
 export default { tools, callTool, meter: { credits: 1 } } satisfies McpToolExport;
