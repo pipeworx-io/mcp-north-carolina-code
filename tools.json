@@ -1,0 +1,38 @@
+[
+  {
+    "name": "nc_general_statute",
+    "description": "Get the FULL TEXT of a section of the North Carolina General Statutes — North Carolina state law — by citation. \"N.C.G.S. 14-17\" is first degree murder. Returns the statutory text with a data_as_of timestamp. Keyless. Use for \"what does North Carolina General Statute 14-17 say\" or to check an NC statute a case relies on.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "section": {
+          "type": "string",
+          "description": "Section as cited, e.g. \"14-17\" or \"20-138.1\". The chapter is the part before the first dash."
+        }
+      },
+      "required": [
+        "section"
+      ]
+    }
+  },
+  {
+    "name": "nc_statute_search",
+    "description": "Search North Carolina General Statutes BY TOPIC or keyword rather than citation — \"election conduct at polling places\", \"landlord retaliatory eviction\", \"concealed handgun permit\". Returns ranked sections with their citations; use nc_general_statute afterward for the full text of one. Full-text search, so it answers questions no citation lookup can. Keyless.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Topic or keywords, e.g. \"election conduct at polling places\"."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Max results, default 10, max 25."
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  }
+]
